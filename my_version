@@ -1,0 +1,793 @@
+
+USE [ehr]
+GO
+/****** Object:  StoredProcedure [dbo].[p_EHR_Dashboardnew]    Script Date: 04/07/2016 13:32:05 ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+
+-- =============================================
+-- Author:		sjindal
+-- Create date: 
+-- Description:	
+-- =============================================
+ALTER PROCEDURE [dbo].[p_EHR_Dashboardnew] 
+AS
+BEGIN
+
+	SET NOCOUNT ON;
+
+    -- Insert statements for procedure here
+    DECLARE @date DATETIME
+
+	SET @date = '20140601'
+--Still need to add the ability for a request to be accessed in portal and EHR
+    if object_id ('tempdb..#ehr_requests') is not null
+drop table #ehr_requests
+
+select
+	ac.description,
+	r.state,
+	r.auto_pick,
+	r.NPI,
+	acr.id as acrid,
+	acr.request_id as acrrequest_id,
+	cast(case when r.real='TRUE' then 1 else 0 end as tinyint) as real,
+	case when r.real=1 and isnull(r.faxed_plan_time, r.ePA_PA_Req) is not null then 1 else 0 end as submitted,
+	CAST (0 as tinyint) as EHR_Submitted,
+	CAST(0 as tinyint) as Portal_Submitted,
+	r.request_date,
+	r.request_date_month,
+	cast(Null as float) as total_revenue,
+	CAST(0 as money) as revenue_to_ehr,
+	CAST (null as datetime) as Revenue_Date,
+	r.revenue_source_category,
+	case when r.ePA_type is not null then 1 else 0 end as epa,
+	r.accessed_online,
+	r.deleted,
+	0 as EHR_Accessed,
+	0 as Portal_Accesed,
+	0 as new_npi,
+	0 as new_npi_init,
+	r.request_outcome,
+	pr.tat_hours,
+	pr.tat_days,
+	cast(0 as money) as missed_revenue,
+	acr.api_consumer_id,
+	ac.id,
+	ac.service_user_id,
+	r.request_id,
+	r.faxed_plan_time,
+	r.ePA_PA_Req,
+	r.downloaded_time,
+	r.ePA_type,
+	r.form_name,
+	r.form_description,
+	CAST(Null as varchar(50)) as pa_type,
+	cd.is_dupe,
+	cast(0 as int) as delete_ind
+into #ehr_requests
+from CMM_Repl..t_api_consumers_requests ACR 
+JOIN CMM_repl..T_API_Consumers AC
+	ON ACR.api_consumer_id = AC.id
+JOIN CMM_DataMart..t_reporting_request R
+	ON ACR.request_id = R.request_id
+LEFT join cmm_dataMart..t_plan_reporting PR
+	on ACR.request_id=PR.request_id
+LEFT JOIN cmm_datamart..t_claims_dupes cd
+	on cd.request_id=acr.request_id
+WHERE
+	(ac.api_type_id=3 and description not like '%ipatientcare%' and r.request_date_month >= @date ) 
+	or (ac.api_type_id=3 and ac.description like '%ipatientcare%' and r.request_date_month>='20150901')
+	--and r.deleted=0
+
+--Identify all requests with more than 1 occurrence in t_api_consumer_requests
+if OBJECT_ID('tempdb..#ReqCount_prep') is not null drop table #ReqCount_prep
+select 
+	er.request_id,
+	COUNT(er.request_id) as Occurrences,
+	api_ehr
+into #ReqCount_prep
+from #ehr_requests er
+left join cmm_datamart..t_reporting_request rr
+	on er.request_id=rr.request_id
+group by er.request_id, api_ehr
+order by Occurrences
+
+--Filter the list to those request_ids with more than 1 occurrance
+if OBJECT_ID('tempdb..#ReqCount') is not null drop table #ReqCount
+select * 
+into #ReqCount
+from #ReqCount_prep
+where Occurrences>1
+
+--Find those where the api_ehr logic has assigned an api_ehr (those we will force to equal the api_ehr logic)
+if OBJECT_ID('tempdb..#ReqCount_wapi') is not null drop table #ReqCount_wapi
+select * 
+into #ReqCount_wapi
+from #ReqCount
+where api_ehr is not null
+
+--Delete the one where the api_description does not equal the api_ehr field
+update #ehr_requests
+	set delete_ind=1
+from #ehr_requests er
+join #ReqCount_wapi rc on er.request_id=rc.request_id
+where api_ehr<>description
+
+--Consolidate those that don't have an api assigned
+if OBJECT_ID('tempdb..#ReqCount_noapi') is not null drop table #ReqCount_noapi
+select *
+into #ReqCount_noAPI
+from #ReqCount
+where api_ehr is null
+
+--******Need to create a table of software vendors (w/ user errors) mapped to description/api_ehr
+--pull in the software vendor of each user that touched the request
+If OBJECT_ID('tempdb..#TouchVendors') is not null drop table #TouchVendors
+select distinct rt.request_id, ru.software_vendor 
+into #TouchVendors
+from cmm_repl..T_RequestTouches rt 
+join cmm_datamart..t_reporting_user ru
+	on rt.user_id=ru.user_id
+where request_id in (select request_id from #ReqCount_noAPI)
+order by request_id
+
+--****Need to use the table mentioned above to link software vendors to client, not the description from api_consumers
+--If software vendor matches description exactly, match those up
+If OBJECT_ID('tempdb..#TouchVendors_Assign') is not null drop table #TouchVendors_Assign
+select distinct request_id, software_vendor
+into #TouchVendors_Assign
+from #TouchVendors
+where software_vendor in (select description from cmm_repl..T_API_Consumers where api_type_id=3)
+
+--Delete the dupes that don't match the software vendor and description
+update #ehr_requests
+	set delete_ind=1
+from #ehr_requests er
+join #TouchVendors_Assign ta
+	on ta.request_id=er.request_id
+where description<>software_vendor
+
+--Find which ones still don't have an assignment
+if OBJECT_ID('tempdb..#Req_NoAssignment') is not null drop table #Req_NoAssignment
+select r.*,t.software_vendor 
+into #Req_NoAssignment
+from #ReqCount_noAPI r
+full outer join #TouchVendors_Assign t
+	on t.request_id=r.request_id
+where t.request_id is null
+
+--Find those with a callback_response of fail
+if OBJECT_ID('tempdb..#Req_FailStatus') is not null drop table #Req_FailStatus
+select api_consumer_id,request_id
+into #Req_FailStatus
+from cmm_repl..T_API_Consumers_Requests acr
+where request_id in (select request_id from #Req_NoAssignment) and callback_response like '%Fail%'
+
+--Delete the dupes with a fail status
+update #ehr_requests
+	set delete_ind=1
+from #ehr_requests er
+join #Req_FailStatus F
+	on F.request_id=er.request_id
+	and er.api_consumer_id=f.api_consumer_id
+
+--Find remaining dupes
+if OBJECT_ID('tempdb..#Req_NeedsAssignment') is not null drop table #Req_NeedsAssignment
+select r.* 
+into #Req_NeedsAssignment
+from #Req_NoAssignment r
+full outer join #Req_FailStatus F
+	on F.request_id=r.request_id
+where F.request_id is null
+
+--Order the remaining by ime
+if OBJECT_ID('tempdb..#Req_remainingassigned') is not null drop table #Req_remainingassigned
+select 
+	*,
+	ROW_NUMBER() OVER(PARTITION BY request_id ORDER BY updated_at) as rnk
+into #Req_remainingassigned
+from cmm_repl..T_API_Consumers_Requests acr
+where request_id in (select request_id from #Req_NeedsAssignment)
+
+--Delete the latter requests
+update #ehr_requests
+	set delete_ind=1
+from #ehr_requests er
+join #Req_remainingassigned RA
+	on ra.request_id=er.request_id
+	and er.api_consumer_id=RA.api_consumer_id 
+where rnk>1
+
+delete from #ehr_requests
+where delete_ind=1
+
+--Identify service user id for EHR apis
+if OBJECT_ID('tempdb..#EHRUserIDs') is not null drop table #EHRUserIDs
+select service_user_id
+into #EHRUserIDs
+from cmm_repl..T_API_Consumers
+where api_type_id=3
+
+--Identify Prospective requests using Request Touches
+if OBJECT_ID('tempdb..#pro_req') is not null
+drop table #pro_req
+
+select *
+into #pro_req
+from cmm_repl..T_RequestTouches
+where 
+	touch_type='101'
+	and user_id in (select * from #EHRUserIDs)
+	
+update #ehr_requests
+	set pa_type='Prospective'
+from #ehr_requests er
+join #pro_req pr on er.request_id=pr.request_id
+
+/*----------------------------------------------------------------------------------------------------------------------
+							COMMENT LINES 100-141ISH
+---------------------------------------------------------------------------------------------------------------------*/
+--Identify Portal Submits vs. EHR submits on the Prospective Requests
+--Find all touches for each request in the prospective request table
+if OBJECT_ID('tempdb..#ProSubmitTouches') is not null drop table #ProSubmitTouches
+select rt1.*, ROW_NUMBER() over (partition by request_id order by time) as count, null as laguser
+into #ProSubmitTouches
+from cmm_repl..T_RequestTouches rt1
+where rt1.request_id in (select request_id from #pro_req)
+
+--Since epa touches don't have a user id, update touch 22 (epa submit) with a user id via the lag
+update T1
+set T1.laguser=T2.user_id
+from #ProSubmitTouches T1
+join #ProSubmitTouches T2
+	on T2.request_id=T1.request_id
+	and T2.count=T1.count-1
+where T1.touch_type=22
+
+update #ProSubmitTouches
+set user_id=laguser
+where touch_type=22 and laguser is not null 
+
+--Identify submitting user id
+if OBJECT_ID('tempdb..#ProSubmitTouchesAll') is not null drop table #ProSubmitTouchesAll
+select distinct request_id,
+	case when touch_type in (8,22) then user_id	end as Submitting_User	
+into #ProSubmitTouchesAll
+from #ProSubmitTouches
+order by request_id
+
+--Identify all submitting users that are the EHR system
+if OBJECT_ID('tempdb..#EHRProSubmit') is not null drop table #EHRProSubmit
+select distinct request_id
+into #EHRProSubmit
+from #ProSubmitTouchesAll
+where submitting_user in (select * from #ehruserids)
+
+--Updated to be submitted by EHR system
+update #ehr_requests
+	set EHR_Submitted=1
+from #ehr_requests er
+join #EHRProSubmit eps on er.request_id=eps.request_id
+where er.submitted=1
+
+--The rest are updated to be submitted by Portal
+update #ehr_requests
+	set Portal_Submitted=1
+from #ehr_requests
+where submitted=1 and pa_type='Prospective' and EHR_Submitted=0
+
+--Get All retrospective requests that have been shared with an EHR
+if OBJECT_ID('tempdb..#retro_req') is not null
+drop table #retro_req
+
+select acr.request_id
+into #retro_req
+from cmm_repl..T_RequestClaims rc --PA+ and EZB requests 99% of Pharmacy requests
+join CMM_Repl..t_api_consumers_requests acr --All requests shared and created by EHR system
+	on rc.request_id=acr.request_id
+
+--Set all as retrospective - will change to portal and ehr later
+update #ehr_requests
+	set pa_type='Retrospective'
+from #ehr_requests er
+join #retro_req rr on er.request_id=rr.request_id
+
+update #ehr_requests
+	set pa_type='Retrospective'
+from #ehr_requests er
+where pa_type is null
+
+--Get All not submitted requests
+if OBJECT_ID('tempdb..#not_submitted') is not null
+drop table #not_submitted
+
+select rreq.request_id
+into #not_submitted
+from #retro_req	rreq
+left join cmm_datamart..t_reporting_request rr
+	on rreq.request_id=RR.request_id
+where (rr.faxed_plan_time is null and rr.ePA_PA_Req is null) or real=0 --and rr.downloaded_time is null)
+
+truncate table #retro_req
+
+insert into #retro_req
+select request_id from #ehr_requests
+where pa_type like '%Retro%'
+
+
+/*----------------------------------------------------------------------------------------------------------------------
+							COMMENT LINES 175-235ISH
+---------------------------------------------------------------------------------------------------------------------*/
+--Decision was made that if the EHR system faxed or epa the request, then it is submitted (no downloads)
+if OBJECT_ID('tempdb..#EHRretrodownload') is not null
+drop table #ehrretrodownload
+
+select rt.request_id, rt.USER_ID
+into #ehrretrodownload
+from cmm_repl..T_RequestTouches rt
+join cmm_datamart..t_reporting_request rr
+	on rr.request_id=rt.request_id
+where 
+	rt.request_id in (select request_id from #retro_req)
+	and rt.touch_type in ('4','6')
+	and rt.user_id in (select * from #ehruserids)
+	and rr.ePA_type is null
+
+--Submitted
+if OBJECT_ID('tempdb..#Retrosubmitted') is not null
+drop table #Retrosubmitted
+
+select rreq.request_id
+into #Retrosubmitted
+from #retro_req	rreq
+left join cmm_datamart..t_reporting_request rr
+	on rreq.request_id=RR.request_id
+where 
+	(rr.faxed_plan_time is not null or rr.ePA_PA_Req is not null) and real=1 --or rr.downloaded_time is not null)
+
+--Add Row numbers so that I can join on itself and assign a user id to touch type 22 (epa_pa_req)
+if OBJECT_ID('tempdb..#retrosubmittouches') is not null drop table #retrosubmittouches
+select rt1.*, ROW_NUMBER() over (partition by request_id order by time) as count, null as laguser
+into #retrosubmittouches
+from cmm_repl..T_RequestTouches rt1
+where rt1.request_id in (select * from #Retrosubmitted)
+
+update T1
+set T1.laguser=T2.user_id
+from #retrosubmittouches T1
+join #retrosubmittouches T2
+	on T2.request_id=T1.request_id
+	and T2.count=T1.count-1
+where T1.touch_type=22
+
+update #retrosubmittouches
+set user_id=laguser
+where touch_type=22 and laguser is not null
+
+--Get all of the users who submitted every request (pulls multiple submitting users if there are multiple submit touches)
+--This does provide the fax from the pharmacy to the physicians office.  This should not affect the analysis
+if OBJECT_ID('tempdb..#ehrsubmitreqsALL') is not null drop table #ehrsubmitreqsALL
+select distinct
+	request_id,
+	case when touch_type in (8,22) then user_id end as Submitting_User	
+into #ehrsubmitreqsALL
+from #retrosubmittouches
+order by request_id
+
+--Identify those that were submitted by the EHR system
+if OBJECT_ID('tempdb..#EHRRetroSubmit') is not null drop table #EHRRetroSubmit
+select distinct request_id
+into #EHRRetroSubmit
+from #ehrsubmitreqsALL
+where submitting_user in (select * from #ehruserids)
+
+--Updated to be submitted by EHR system
+update #ehr_requests
+	set EHR_Submitted=1
+from #ehr_requests er
+join #EHRRetroSubmit ers on er.request_id=ers.request_id
+where er.submitted=1
+
+--Identify all retro submitted requests
+if OBJECT_ID('tempdb..#submitted') is not null
+drop table #submitted
+
+select rreq.request_id
+into #submitted
+from #retro_req	rreq
+left join cmm_datamart..t_reporting_request rr
+	on rreq.request_id=RR.request_id
+where 
+	(rr.faxed_plan_time is not null or rr.ePA_PA_Req is not null) and real=1 --or rr.downloaded_time is not null)
+
+/*----------------------------------------------------------------------------------------------------------------------
+							COMMENT LINES 251-260ISH
+---------------------------------------------------------------------------------------------------------------------*/
+--Pull all Portal Retro Submitted Requests (all that aren't ehr submitted)
+if OBJECT_ID('tempdb..#PortalSubmitted') is not null drop table #PortalSubmitted
+select distinct 
+	s.request_id
+into #PortalSubmitted
+from #submitted s 
+left join #EHRRetroSubmit ers 
+	on ers.request_id=s.request_id 
+where ers.request_id is null
+
+--Update Portal submitted as an indicator
+update #ehr_requests
+	set Portal_Submitted=1
+from #ehr_requests er
+join #PortalSubmitted PS on er.request_id=PS.request_id
+where er.submitted=1
+
+--Identify EHR Touches and update those with EHR Accessed - Do not count those with a delete touch because sometimes the double ehr thing does a delete touch
+if OBJECT_ID('tempdb..#EHR_touches') is not null
+drop table #EHR_touches
+
+select distinct
+	request_id
+into #ehr_touches
+from 
+	cmm_repl..t_requesttouches rt 
+where
+	user_id IN (select * from #EHRUserIDs)
+	and rt.touch_type<>'102'
+
+--Identify non-EHR touches and update those with Portal Accessed
+if OBJECT_ID('tempdb..#creator_touches') is not null
+drop table #creator_touches
+
+select distinct
+	r.request_id,
+	rt.touch_type,
+	rt.user_id as Creator_user_ID
+into #creator_touches
+from 
+	#retro_req r
+join cmm_repl..T_RequestTouches rt
+	on r.request_id=rt.request_id
+where
+	touch_type='101'
+
+if OBJECT_ID('tempdb..#retro_touches') is not null
+drop table #retro_touches
+
+select
+	r.request_id,
+	rt.touch_type,
+	rt.user_id
+into #retro_touches
+from 
+	cmm_repl..T_RequestTouches rt
+join #retro_req r
+	on rt.request_id=r.request_id
+
+if OBJECT_ID('tempdb..#retro_creator_combo') is not null
+drop table #retro_creator_combo
+
+select
+	rt.request_id,
+	rt.touch_type,
+	rt.user_id,
+	ct.Creator_user_ID,
+	0 as Portal_touched
+into #retro_creator_combo
+from #retro_touches rt
+join #creator_touches ct
+	on rt.request_id=ct.request_id
+
+update #retro_creator_combo
+	set Portal_touched=1
+where USER_ID<>Creator_user_ID
+	and USER_ID not in (select * from #EHRUserIDs)
+
+if OBJECT_ID('tempdb..#portal_touches') is not null
+drop table #portal_touches
+
+select 
+	distinct request_id,
+	MAX(portal_touched) as Portal_touch
+into #portal_touches
+from #retro_creator_combo
+group by request_id
+
+delete from #portal_touches
+where Portal_touch=0
+
+update #ehr_requests
+	set Portal_Accesed=1
+from #ehr_requests er
+join #portal_touches pt on er.request_id=pt.request_id
+
+if OBJECT_ID('tempdb..#EHR_notpro_touches') is not null
+drop table #EHR_notpro_touches
+
+select *
+into #ehr_notpro_touches
+from #retro_touches
+where 
+	touch_type NOT IN ('101','102') and user_id in (select * from #EHRUserIDs)
+
+update #ehr_requests
+	set EHR_Accessed=1
+from #ehr_requests er
+join #ehr_notpro_touches et on er.request_id=et.request_id
+	
+--Join to submitted to get EHR Retro submissions
+if OBJECT_ID('tempdb..#ehr_retro') is not null 
+drop table #ehr_retro
+
+select s.request_id
+into #ehr_retro
+from #submitted s
+join #ehr_touches et
+	on s.request_id=et.request_id
+
+/*insert into #ehr_retro
+select request_id
+from #ehrretrodownload*/
+
+--EHR retro is set to epa type when the ehr system submitted it
+update #ehr_requests
+	set pa_type='EHR Retrospective'
+from #ehr_requests er
+join #ehr_retro ehr on er.request_id=ehr.request_id
+
+--Rest of retro submitted must be portal submitted
+if OBJECT_ID('tempdb..#portal_retro') is not null
+drop table #portal_retro
+
+select s.request_id 
+into #portal_retro
+from #submitted s 
+left join #ehr_retro er
+	on s.request_id = er.request_id 
+where er.request_id is null
+
+update #ehr_requests
+	set pa_type='Portal Retrospective'
+from #ehr_requests er
+join #portal_retro pr on er.request_id=pr.request_id
+
+--Bring in CMM revenue along with ehr commission (rev to ehr)
+update #ehr_requests
+set total_revenue=cast(gross_pharma_revenue + gross_plan_revenue as float),
+	revenue_to_ehr = cast(ehr_pharma_commission + ehr_plan_commission as float),
+	Revenue_Date=r.Revenue_Date
+from #ehr_requests ER
+join billing..RequestRevenue R on ER.request_id=R.Request_ID
+
+--Find first time we saw and NPI that submitted something by month
+if OBJECT_ID('tempdb..#NPI_Rank') is not null drop table #NPI_Rank
+SELECT
+	npi,
+	request_id,
+	er.request_date,
+	er.request_date_month,
+	ROW_NUMBER() OVER(PARTITION BY npi, request_date_month ORDER BY request_date) as rnk
+INTO #NPI_Rank
+FROM #ehr_requests er
+WHERE EHR_Submitted = 1
+
+--Find first time we saw and NPI by month
+if OBJECT_ID('tempdb..#NPI_Rank_init') is not null drop table #NPI_Rank_init
+SELECT
+	npi,
+	request_id,
+	er.request_date,
+	er.request_date_month,
+	ROW_NUMBER() OVER(PARTITION BY npi, request_date_month ORDER BY request_date) as rnk
+INTO #NPI_Rank_init
+FROM #ehr_requests er
+
+update #ehr_requests
+set new_npi=0
+update #ehr_requests
+set new_npi_init=0
+
+UPDATE #ehr_requests
+SET new_npi = 1
+FROM #ehr_requests er
+JOIN #NPI_Rank N on er.request_id = N.request_id
+WHERE rnk = 1
+
+
+UPDATE #ehr_requests
+SET new_npi_init = 1
+FROM #ehr_requests er
+JOIN #NPI_Rank_init N on er.request_id = N.request_id
+WHERE rnk = 1
+
+
+/*
+select *, row_number()over(partition by request_id order by pa_type) as rwnum
+ from ehr.dbo.tmp_bh_ehr_retroflag_root_history
+order by request_id,rwnum
+
+CREATE TABLE ehr.dbo.tmp_bh_ehr_retroflag_root_history
+(
+request_id VARCHAR(6) NOT NULL,
+ehr_submitted BIT,
+pa_type VARCHAR(100),
+history_dt DATETIME DEFAULT GETDATE())
+*/
+
+   INSERT tmp_bh_ehr_retroflag_root_history
+   SELECT t.request_id,
+          t.ehr_submitted,
+          ISNULL(t.pa_type,''),
+          GETDATE()
+     FROM #ehr_requests t
+LEFT JOIN (SELECT request_id, MAX(history_dt) as m FROM tmp_bh_ehr_retroflag_root_history GROUP BY request_id) m
+       ON t.request_id = m.request_id
+LEFT JOIN tmp_bh_ehr_retroflag_root_history h
+       ON t.request_id = h.request_id
+      AND m.m = h.history_dt
+    WHERE h.request_id IS NULL
+       OR t.EHR_Submitted <> h.ehr_submitted
+       OR ISNULL(t.pa_type,'') <> ISNULL(h.pa_type,'')          
+          
+ 
+
+
+--Create final table (excluding NPI stuff)
+
+IF OBJECT_ID ('tempdb..#root') IS NOT NULL
+drop table #root
+
+--insert into #root
+select
+	request_id,
+	description,
+	request_date,
+	Revenue_Date,
+	DATEADD(mm,DATEDIFF(mm,0,REvenue_Date),0) as Revenue_month,
+	request_date_month,
+	pa_type,
+	state,
+	NPI,
+	revenue_source_category,	
+	real,
+	deleted,
+	case when pa_type='Prospective' then 1 else 0 end as Prospective,
+	case when pa_type like '%Retrospective%' then 1 else 0 end as Retrospective,
+	case when pa_type='EHR Retrospective' then 1 else 0 end as EHRRetrospective,
+	case when pa_type='Portal Retrospective' then 1 else 0 end as PortalRetrospective,
+	case when pa_type Is null then 1 else 0 end as NoPAType,
+	ePA_PA_Req,
+	faxed_plan_time,
+	downloaded_time,
+	ePA_type,
+	form_name,
+	form_description,
+	ISNULL(faxed_plan_time, epa_pa_req) as Submitted_Time,
+	isnull(dateadd(mm,datediff(mm,0,ISNULL(faxed_plan_time, epa_pa_req)),0),0) as Submitted_Month,
+	case when is_dupe<>1 or is_dupe is null then submitted else 0 end as Submitted,
+	case when is_dupe<>1 or is_dupe is null then EHR_Submitted else 0 end as EHR_Submitted,
+	case when is_dupe<>1 or is_dupe is null then Portal_Submitted else 0 end as Portal_Submitted,
+	case when pa_type='Prospective' and submitted=1 then 1 else 0 end as Pro_submitted,
+--These EHRretro submit and portal retro submit are needed to do the pivot for real rate in the dashboard
+	case when EHR_Submitted=1 and pa_type like '%Retro%' then 1 else 0 end as EHRretro_submitted,--bhaas
+	case when Portal_Submitted=1 and pa_type like '%Retro%' then 1 else 0 end as Portalretro_submitted,
+	epa,
+	accessed_online,
+	EHR_Accessed,
+	Portal_Accesed,
+	new_npi,
+	new_npi_init,
+	auto_pick,
+	TAT_Hours,
+	case when request_outcome='Favorable' then 1 else 0 end as favorable,
+	case when request_outcome IN ('Favorable','Unfavorable') then 1 else 0 end as Total_Archived,
+	case when pa_type='Prospective' and request_outcome is null and deleted=1 and submitted=0 then 1 else 0 end as ProDeleted,
+	revenue_to_ehr,
+	case when (description='stratusemr' and pa_type='Prospective' and submitted=0) then 1.00
+		when (description='stratusemr' and pa_type='Portal Retrospective' and submitted=1) then 0.25
+		when (description='DrFirst' and pa_type='Prospective' and submitted=0) then 1.75
+		when (description='DrFirst' and pa_type='Portal Retrospective'and submitted=1) then 1.00
+		when (description='Production Consumer for NewCrop Connector' and pa_type='Prospective' and submitted=0) then 1.00
+		when (description='Production Consumer for NewCrop Connector' and pa_type='Portal Retrospective'and submitted=1) then 0.25
+		when (description='Practice Fusion' and pa_type='Prospective' and submitted=0) then 1.50
+		when (description='Practice Fusion' and pa_type='Portal Retrospective'and submitted=1) then 0.25
+		when (description='ipatientcare' and pa_type='Prospective' and submitted=0) then 1.00
+		when (description='ipatientcare' and pa_type='Portal Retrospective'and submitted=1) then 0.25
+		when (description='Acrendo Software Inc.' and pa_type='Prospective' and submitted=0) then 1.00
+		when (description='Acrendo Software Inc.' and pa_type='Portal Retrospective'and submitted=1) then 0.25
+		when (description='ReLi Med Solutions' and pa_type='Prospective' and submitted=0) then 1.00
+		when (description='ReLi Med Solutions' and pa_type='Portal Retrospective'and submitted=1) then 0.25
+		else 0
+		end
+	as missed_revenue,
+	total_revenue,
+	case when request_date_month between DATEADD(mm,Datediff(mm,0,getdate())-12,0) and DATEADD(mm,Datediff(mm,0,getdate())-1,0) then 1 else 0 end as last12Mos,
+	case when dateadd(mm,datediff(mm,0,ISNULL(faxed_plan_time, epa_pa_req)),0) between DATEADD(mm,Datediff(mm,0,getdate())-12,0) and DATEADD(mm,Datediff(mm,0,getdate())-1,0) then 1 else 0 end as last12Mos_sub,
+	CASE DATEPART(dw, request_date)
+	WHEN 1 THEN 'WEEKEND'
+	WHEN 2 THEN 'Weekday'
+	WHEN 3 THEN 'Weekday'
+	WHEN 4 THEN 'Weekday'
+	WHEN 5 THEN 'Weekday'
+	WHEN 6 THEN 'Weekday'
+	WHEN 7 THEN 'WEEKEND'
+	END as WorkDay
+into #root
+from #ehr_requests
+where delete_ind=0
+
+----------------------------- -------------------------------------------------------------------------------
+/*
+select distinct m.request_id, 
+sum(case when epa_message like '%no%pa%required%' or epa_message like '%pa%not%required%' 
+or epa_message like '%not%manage%' or epa_message like '%patient%not%found%' or epa_message like '%cannot%be%completed%' 
+--or 
+--epa_message like '%Patient%incactive%'  or epa_message like '%PA%already%' or epa_message like '%no%coverage%'
+--or epa_message like '%member%not%found%'
+then 1 else 0 end) as Errors 
+into #temp
+from cmm_datamart..t_epa_messaging m
+join ehr..t_ehr_ehrdashboardnew_daily e
+on e.request_id =m.request_id
+group by m.request_id
+
+select r.*,
+case when m.Errors > 0 
+then 1 else 0 end as Errors
+into #root2
+from #root r left join
+#temp m
+on r.request_id=m.request_id
+*/
+
+--------------------------------------------------------------------------------------------------------------------
+
+select distinct e.request_id,
+CASE WHEN ePA_Ques_Req IS NOT NULL  AND ePA_Ques_Resp IS NOT NULL AND request_outcome = 'N/A'                    
+THEN 1 ELSE 0              
+END as Errors 
+into #temp
+from cmm_datamart..t_reporting_request p
+join ehr..t_ehr_ehrdashboardnew_daily e
+on e.request_id =p.request_id
+where e.Submitted = 0 and epa= 1
+
+select r.*,
+case when m.Errors > 0 
+then 1 else 0 end as Errors
+into #root2
+from #root r left join
+#temp m
+on r.request_id=m.request_id
+
+/*
+truncate table ehr.dbo.t_ehr_ehrdashboardnew_daily
+insert into ehr.dbo.t_ehr_ehrdashboardnew_daily
+select * 
+from #root2
+*/
+
+select a.*,case when b.revenue_source='EHR' then 'EHR' ELSE 'OTHER' end as Rev_source
+into #root3
+from #root2 a join 
+cmm_datamart..t_reporting_request b 
+on a.request_id =b.request_id
+
+truncate table ehr.dbo.t_ehr_ehrdashboardnew_daily
+insert into ehr.dbo.t_ehr_ehrdashboardnew_daily
+select * 
+from #root3
+
+
+truncate table domo.dbo.t_dba_ehrdashboard_daily
+insert into domo.dbo.t_dba_ehrdashboard_daily
+Select * 
+from ehr.dbo.t_ehr_ehrdashboardnew_daily
+
+------------------------------ Tracking Billing -------------------------
+
+
+
+END
+
